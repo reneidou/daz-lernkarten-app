@@ -4,7 +4,7 @@ import { Auth } from './pages/Auth';
 import { Dashboard } from './pages/Dashboard';
 import { Trainer } from './pages/Trainer';
 import { Pricing } from './pages/Pricing';
-import { supabase } from './supabase';
+import { supabase, supabaseConfigured } from './supabase';
 
 function App() {
   const [page, setPage] = useState('landing');
@@ -25,12 +25,22 @@ function App() {
 
   useEffect(() => {
     const checkUser = async () => {
-      const { data: { user: authUser } } = await supabase.auth.getUser();
-      setUser(authUser);
-      setLoading(false);
+      if (!supabaseConfigured) {
+        setLoading(false);
+        return;
+      }
 
-      if (authUser && page === 'landing') {
-        window.location.hash = 'dashboard';
+      try {
+        const { data: { user: authUser } } = await supabase.auth.getUser();
+        setUser(authUser);
+
+        if (authUser && page === 'landing') {
+          window.location.hash = 'dashboard';
+        }
+      } catch (error) {
+        console.error('Auth check failed:', error);
+      } finally {
+        setLoading(false);
       }
     };
 

@@ -28,7 +28,6 @@ export function Dashboard() {
   const [progress, setProgress] = useState<UserProgress[]>([]);
   const [phrases, setPhrasesState] = useState<Record<string, Phrase>>({});
   const [loading, setLoading] = useState(true);
-  const [user, setUser] = useState<any>(null);
 
   useEffect(() => {
     loadData();
@@ -41,8 +40,6 @@ export function Dashboard() {
         navigate('login');
         return;
       }
-      setUser(authUser);
-
       const { data: levelData } = await supabase
         .from('user_levels')
         .select('*')
