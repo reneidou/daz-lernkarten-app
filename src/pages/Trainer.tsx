@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, XCircle, RotateCcw, ChevronRight, Zap } from 'lucide-react';
+import { CheckCircle2, XCircle, ChevronRight, Zap } from 'lucide-react';
 import { supabase } from '../supabase';
 import { useNavigate } from '../hooks/useRouter';
 
@@ -8,9 +8,11 @@ interface Phrase {
   german_phrase: string;
   english_translation: string;
   context: string;
+  category?: string;
 }
 
 interface UserProgress {
+  id?: string;
   phrase_id: string;
   mastery_level: number;
   correct_count: number;
