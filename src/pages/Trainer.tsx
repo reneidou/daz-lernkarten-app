@@ -9,6 +9,7 @@ interface Phrase {
   english_translation: string;
   context: string;
   category?: string;
+  level: number;
 }
 
 interface UserProgress {
@@ -17,11 +18,12 @@ interface UserProgress {
   mastery_level: number;
   correct_count: number;
   incorrect_count: number;
+  next_review: string;
 }
 
 export function Trainer() {
   const navigate = useNavigate();
-  const [phrases, setPhrasesState] = useState<Phrase[]>([]);
+  const [phrases, setPhrases] = useState<Phrase[]>([]);
   const [userProgress, setUserProgress] = useState<Record<string, UserProgress>>({});
   const [currentIndex, setCurrentIndex] = useState(0);
   const [showTranslation, setShowTranslation] = useState(false);
@@ -29,6 +31,9 @@ export function Trainer() {
   const [userLevel, setUserLevel] = useState(1);
   const [todayCount, setTodayCount] = useState(0);
   const [user, setUser] = useState<any>(null);
+  const [isPremium, setIsPremium] = useState(false); // Placeholder for premium status
+
+  const DAILY_LIMIT_FREE = 10;
 
   useEffect(() => {
     loadData();
@@ -43,19 +48,19 @@ export function Trainer() {
       }
       setUser(authUser);
 
+      // Fetch user level
       const { data: levelData } = await supabase
         .from('user_levels')
         .select('current_level')
         .eq('user_id', authUser.id)
         .maybeSingle();
-
       if (levelData) setUserLevel(levelData.current_level);
 
+      // Fetch user progress
       const { data: progressData } = await supabase
         .from('user_progress')
         .select('*')
         .eq('user_id', authUser.id);
-
       const progressMap: Record<string, UserProgress> = {};
       if (progressData) {
         progressData.forEach(p => {
@@ -64,28 +69,92 @@ export function Trainer() {
       }
       setUserProgress(progressMap);
 
-      const { data: phrasesData } = await supabase
-        .from('phrases')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(20);
+      // Fetch phrases (due reviews + new phrases close to level)
+      const today = new Date().toISOString();
+      // 1. Phrases due for review (next_review <= now)
+      const duePhraseIds = Object.keys(progressMap).filter(id => {
+        const p = progressMap[id];
+        return p.next_review && p.next_review <= today;
+      });
 
-      if (phrasesData) {
-        const sorted = phrasesData.sort((a, b) => {
-          const aProgress = progressMap[a.id];
-          const bProgress = progressMap[b.id];
-          const aScore = (aProgress?.correct_count || 0) / Math.max((aProgress?.correct_count || 0) + (aProgress?.incorrect_count || 0), 1);
-          const bScore = (bProgress?.correct_count || 0) / Math.max((bProgress?.correct_count || 0) + (bProgress?.incorrect_count || 0), 1);
-          return aScore - bScore;
-        });
-        setPhrasesState(sorted);
-        setTodayCount(0);
+      let duePhrases: Phrase[] = [];
+      if (duePhraseIds.length > 0) {
+        const { data: dueData } = await supabase
+          .from('phrases')
+          .select('*')
+          .in('id', duePhraseIds);
+        if (dueData) duePhrases = dueData;
       }
 
+      // 2. New phrases not yet in progress, ordered by closeness to user level
+      const learnedIds = Object.keys(progressMap);
+      const { data: newPhrasesData } = await supabase
+        .from('phrases')
+        .select('*')
+        .not('id', 'in', `(${learnedIds.join(',') || ''})`)
+        .order('level', { ascending: true });
+
+      let newPhrases: Phrase[] = [];
+      if (newPhrasesData) {
+        // Sort by absolute difference to user level
+        newPhrases = newPhrasesData.sort((a, b) => {
+          const diffA = Math.abs(a.level - userLevel);
+          const diffB = Math.abs(b.level - userLevel);
+          return diffA - diffB;
+        });
+      }
+
+      // Combine: due first, then new phrases up to limit
+      let allPhrases = [...duePhrases];
+      const remainingSlots = (isPremium ? 100 : DAILY_LIMIT_FREE) - duePhrases.length;
+      if (remainingSlots > 0) {
+        allPhrases = allPhrases.concat(newPhrases.slice(0, remainingSlots));
+      }
+
+      setPhrases(allPhrases);
+      setTodayCount(0);
       setLoading(false);
     } catch (error) {
       console.error('Error loading data:', error);
     }
+  };
+
+  // Calculate new level based on recent performance
+  const computeNewLevel = async (userId: string) => {
+    // Fetch last 20 progress records (most recent reviews) for this user
+    const { data: recentProgress } = await supabase
+      .from('user_progress')
+      .select('correct_count, incorrect_count, updated_at')
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false })
+      .limit(20);
+
+    if (!recentProgress || recentProgress.length === 0) return userLevel;
+
+    let totalCorrect = 0;
+    let totalAttempts = 0;
+    recentProgress.forEach(p => {
+      totalCorrect += p.correct_count;
+      totalAttempts += p.correct_count + p.incorrect_count;
+    });
+    const successRate = totalAttempts > 0 ? totalCorrect / totalAttempts : 0.5;
+
+    // Adjust level: if success rate > 0.7 -> increase, if < 0.5 -> decrease
+    let delta = 0;
+    if (successRate > 0.7) delta = 1;
+    else if (successRate < 0.5) delta = -1;
+
+    let newLevel = userLevel + delta;
+    newLevel = Math.min(100, Math.max(1, newLevel));
+
+    // Update user_levels table
+    await supabase
+      .from('user_levels')
+      .update({ current_level: newLevel, updated_at: new Date().toISOString() })
+      .eq('user_id', userId);
+
+    setUserLevel(newLevel);
+    return newLevel;
   };
 
   const handleCorrect = async () => {
@@ -96,13 +165,15 @@ export function Trainer() {
 
     try {
       if (progress) {
+        const newMastery = Math.min(100, (progress.mastery_level || 0) + 10);
+        const nextReview = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
         await supabase
           .from('user_progress')
           .update({
             correct_count: progress.correct_count + 1,
-            mastery_level: Math.min(100, (progress.mastery_level || 0) + 10),
+            mastery_level: newMastery,
             last_reviewed: new Date().toISOString(),
-            next_review: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            next_review: nextReview,
             updated_at: new Date().toISOString(),
           })
           .eq('id', progress.id);
@@ -119,6 +190,7 @@ export function Trainer() {
           });
       }
 
+      // Update local state
       setUserProgress(prev => ({
         ...prev,
         [phrase.id]: {
@@ -127,6 +199,9 @@ export function Trainer() {
           mastery_level: Math.min(100, (prev[phrase.id]?.mastery_level || 0) + 10),
         }
       }));
+
+      // Recalculate level after a few answers (could be done after each)
+      await computeNewLevel(user.id);
 
       moveToNext();
     } catch (error) {
@@ -142,13 +217,15 @@ export function Trainer() {
 
     try {
       if (progress) {
+        const newMastery = Math.max(0, (progress.mastery_level || 0) - 5);
+        const nextReview = new Date(Date.now() + 1 * 60 * 60 * 1000).toISOString(); // 1 hour
         await supabase
           .from('user_progress')
           .update({
             incorrect_count: progress.incorrect_count + 1,
-            mastery_level: Math.max(0, (progress.mastery_level || 0) - 5),
+            mastery_level: newMastery,
             last_reviewed: new Date().toISOString(),
-            next_review: new Date(Date.now() + 1 * 60 * 60 * 1000).toISOString(),
+            next_review: nextReview,
             updated_at: new Date().toISOString(),
           })
           .eq('id', progress.id);
@@ -174,6 +251,8 @@ export function Trainer() {
         }
       }));
 
+      await computeNewLevel(user.id);
+
       moveToNext();
     } catch (error) {
       console.error('Error updating progress:', error);
@@ -186,6 +265,7 @@ export function Trainer() {
       setShowTranslation(false);
       setTodayCount(todayCount + 1);
     } else {
+      // End of list – maybe reload new phrases or show completion screen
       setShowTranslation(false);
     }
   };
@@ -205,7 +285,13 @@ export function Trainer() {
     return (
       <div className="min-h-screen bg-gradient-to-b from-blue-50 to-white flex items-center justify-center">
         <div className="text-center">
-          <p className="text-gray-600">No phrases available yet.</p>
+          <p className="text-gray-600">No phrases available yet. Please check back later.</p>
+          <button
+            onClick={() => navigate('dashboard')}
+            className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+          >
+            Back to Dashboard
+          </button>
         </div>
       </div>
     );
@@ -221,7 +307,7 @@ export function Trainer() {
         <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
           <div>
             <h1 className="text-lg font-semibold text-gray-900">Daily Practice</h1>
-            <p className="text-sm text-gray-600">Level {userLevel.toFixed(1)}</p>
+            <p className="text-sm text-gray-600">Level {Math.round(userLevel)}</p>
           </div>
           <button
             onClick={() => navigate('dashboard')}
@@ -236,28 +322,35 @@ export function Trainer() {
         <div className="mb-8">
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-medium text-gray-600">Progress Today</span>
-            <span className="text-sm font-semibold text-blue-600">{todayCount}/10</span>
+            <span className="text-sm font-semibold text-blue-600">
+              {todayCount}/{isPremium ? '∞' : DAILY_LIMIT_FREE}
+            </span>
           </div>
-          <div className="w-full bg-gray-200 rounded-full h-2">
-            <div
-              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-              style={{ width: `${(todayCount / 10) * 100}%` }}
-            />
-          </div>
+          {!isPremium && (
+            <div className="w-full bg-gray-200 rounded-full h-2">
+              <div
+                className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${(todayCount / DAILY_LIMIT_FREE) * 100}%` }}
+              />
+            </div>
+          )}
         </div>
 
-        {todayCount >= 10 ? (
+        {(!isPremium && todayCount >= DAILY_LIMIT_FREE) ? (
           <div className="bg-gradient-to-br from-green-50 to-emerald-50 border-2 border-green-200 rounded-lg p-12 text-center">
             <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
               <CheckCircle2 className="w-8 h-8 text-green-600" />
             </div>
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Perfect!</h2>
-            <p className="text-gray-600 mb-6">You've completed 10 phrases today. Come back tomorrow to continue your streak!</p>
+            <h2 className="text-2xl font-bold text-gray-900 mb-2">Great job!</h2>
+            <p className="text-gray-600 mb-6">
+              You've reached your daily limit of {DAILY_LIMIT_FREE} phrases.
+              Upgrade to Premium to continue learning unlimited phrases today!
+            </p>
             <button
-              onClick={() => navigate('dashboard')}
+              onClick={() => navigate('pricing')}
               className="inline-block px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-semibold"
             >
-              View Dashboard
+              Upgrade Now
             </button>
           </div>
         ) : (
@@ -276,12 +369,14 @@ export function Trainer() {
             </div>
 
             <div className="text-center mb-12">
-              <div className="inline-block mb-6">
-                <span className="inline-flex items-center gap-2 px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm font-medium">
-                  <Zap className="w-4 h-4" />
-                  {phrase.category}
-                </span>
-              </div>
+              {phrase.category && (
+                <div className="inline-block mb-6">
+                  <span className="inline-flex items-center gap-2 px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm font-medium">
+                    <Zap className="w-4 h-4" />
+                    {phrase.category}
+                  </span>
+                </div>
+              )}
 
               <p className="text-5xl md:text-6xl font-bold text-gray-900 mb-6 break-words">
                 {phrase.german_phrase}
